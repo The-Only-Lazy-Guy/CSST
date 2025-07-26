@@ -8,6 +8,7 @@ import logging
 from torch.utils.checkpoint import checkpoint
 import gc
 
+print("Using PyTorch version:", torch.__version__)
 logger = logging.getLogger("csst_model")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
