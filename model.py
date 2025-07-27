@@ -8,7 +8,6 @@ import logging
 from torch.utils.checkpoint import checkpoint
 import gc
 
-asdasdasd
 
 logger = logging.getLogger("csst_model")
 logger.setLevel(logging.INFO)
@@ -55,14 +54,14 @@ class VectorizedLIF(nn.Module):
         self.linear.weight.data.clamp_(-0.1, 0.1)
         
         # Spike monitoring
-        self.register_buffer('spike_activity', None)
-        self.register_buffer('last_rate', torch.tensor(0.0))
+        self.register_buffer('spike_activity', None, persistent=False)
+        self.register_buffer('last_rate', torch.tensor(0.0), persistent=False)
         self.reset()
 
     def reset(self):
         self.spike_activity = None
         self.last_rate.fill_(0.0)
-
+        self.trace = None  # For EfficientHebbian
     def spike_rate(self):
         return self.last_rate.item()
 
@@ -185,36 +184,58 @@ class EfficientHebbian(nn.Module):
         # Hebbian-specific parameters
         self.eta = 0.01
         self.hebb_scale = 1 / math.sqrt(in_dim)
-        self.register_buffer('trace', None)
+        self.register_buffer('trace', None, persistent=False)
+        
+    def _safe_svd(self, weight):
+        """Handles SVD with automatic fallback to CPU if needed"""
+        try:
+            # First try CUDA SVD with FP32
+            if weight.is_cuda:
+                return torch.svd(weight.float())
+            return torch.svd(weight)
+        except RuntimeError:
+            # Fallback to CPU if CUDA SVD fails
+            cpu_weight = weight.float().cpu()
+            U, S, V = torch.svd(cpu_weight)
+            return U.to(weight.device), S.to(weight.device), V.to(weight.device)
         
     def forward(self, x):
-        x = self.norm1(x)
+        # Convert to FP32 for stable Hebbian updates
+        x = self.norm1(x.float() if x.dtype != torch.float32 else x)
         B, T, D = x.size()
         flat_x = x.view(B * T, D)
         
-        # Normal forward pass
-        y = F.linear(flat_x, self.weight)
+        # Forward pass (automatic mixed precision friendly)
+        y = F.linear(flat_x, self.weight.float() if self.weight.dtype != torch.float32 else self.weight)
         y_out = y.view(B, T, self.out_dim)
         
-        # Hebbian update without affecting autograd graph
+        # Hebbian update (always in FP32)
         if self.training:
             with torch.no_grad():
+                # Initialize trace if needed
                 if self.trace is None:
-                    self.trace = torch.zeros(self.out_dim, self.in_dim, device=y.device)
+                    self.trace = torch.zeros(self.out_dim, self.in_dim, 
+                                           device=y.device, dtype=torch.float32)
                 
-                # Update trace using exponential moving average
-                self.trace = 0.9 * self.trace + self.hebb_scale * torch.mm(y.t(), flat_x)
+                # FP32 Hebbian updates
+                y_f32 = y.float()
+                flat_x_f32 = flat_x.float()
+                self.trace = 0.9 * self.trace + self.hebb_scale * torch.mm(y_f32.t(), flat_x_f32)
                 
-                # Apply normalized update
+                # Apply update
                 update = torch.clamp(self.trace, -1.0, 1.0)
-                self.weight.data += self.eta * update
+                self.weight.data += (self.eta * update).to(self.weight.dtype)
                 
-                # Normalize columns
-                col_norms = self.weight.norm(dim=0, keepdim=True).clamp(min=1e-3)
+                # Normalize and orthogonalize
+                col_norms = torch.linalg.norm(self.weight.data, dim=0, keepdim=True).clamp(min=1e-3)
                 self.weight.data.div_(col_norms)
+                
+                # Stable SVD with fallback
+                U, _, V = self._safe_svd(self.weight.data)
+                self.weight.data = (U @ V.T).to(self.weight.dtype)
 
-        return y_out
-
+        return y_out.to(x.dtype)  # Return to original input dtype
+    
 class EfficientUltraBlock(nn.Module):
     def __init__(self, dim, context_size=512, block_id=None, use_checkpoint=False):
         super().__init__()
@@ -236,11 +257,12 @@ class EfficientUltraBlock(nn.Module):
     def forward(self, x, global_context):
         spike_output = self.spike_layer(x)
         lif_spike_rate = self.spike_layer.spike_rate()
-        self.spike_rate = torch.tensor(lif_spike_rate)
+        self.spike_rate = torch.tensor(lif_spike_rate, device='cpu')
+
 
         # Conditional checkpointing
         if self.use_checkpoint:
-            hebb_out = checkpoint(self.hebbian, spike_output, use_reentrant=False)
+            hebb_out = checkpoint(self.hebbian, spike_output, use_reentrant=True)
         else:
             hebb_out = self.hebbian(spike_output)
             
@@ -248,7 +270,7 @@ class EfficientUltraBlock(nn.Module):
         attn_in = self.norm(hebb_out)
         
         if self.use_checkpoint:
-            attn_out = checkpoint(self.entangled_attn, attn_in, use_reentrant=False)
+            attn_out = checkpoint(self.entangled_attn, attn_in, use_reentrant=True)
         else:
             attn_out = self.entangled_attn(attn_in)
 
@@ -262,10 +284,10 @@ class EfficientUltraBlock(nn.Module):
         steps = getattr(self, 'noise_step', 0)
         max_steps = 1000
         annealed_scale = max(0.0, 1 - steps / max_steps)
-        self.noise_step = steps + 1
+        self.noise_step = (steps + 1) % max_steps  # Cyclic annealing
+
         noise_std = torch.clamp(self.quantum_scale.abs(), min=1e-6, max=0.003) * annealed_scale
         noise = torch.randn_like(signal_path) * noise_std
-
         gated_out = signal_path + noise
         gated_out = self.norm(gated_out)
         return gated_out, compressed_context
@@ -322,21 +344,67 @@ class EfficientCSST_Ultra(nn.Module):
         total = sum(p.numel() for p in self.parameters())
         embed_params = self.embed.weight.numel()
         return total, embed_params, total - embed_params
-
+    
 class MemoryEfficientQAOptimizer(torch.optim.AdamW):
-    def __init__(self, params, lr=1e-3, tunneling=0.05, fused=True, **kwargs):
-        super().__init__(params, lr=lr, fused=fused, **kwargs)
+    def __init__(self, params, lr=1e-3, tunneling=0.01, fused=True, **kwargs):
         self.tunneling = tunneling
+        self._grad_norm = 0.0
+        self._noise_buffers = {}
+        self._param_devices = {}
+
+        super().__init__(params, lr=lr, fused=fused, **kwargs)
+
+
+    def add_param_group(self, param_group):
+        super().add_param_group(param_group)
+        for p in param_group['params']:
+            param_id = id(p)
+            self._param_devices[param_id] = p.device
+            self._noise_buffers[param_id] = torch.empty_like(p, device=p.device)
 
     @torch.no_grad()
     def step(self, closure=None):
-        loss = super().step(closure)
+        self._grad_norm = 0.0
+
+        # AMP-safe gradient norm calculation
         for group in self.param_groups:
             for p in group['params']:
-                if p.grad is not None and torch.isfinite(p.grad).all():
-                    noise = torch.randn_like(p) * self.tunneling
-                    p.data.add_(noise)
+                if p.grad is not None:
+                    if p.grad.dtype == torch.bfloat16:
+                        p.grad = p.grad.float()
+                    self._grad_norm += p.grad.pow(2).sum().item()
+
+        self._grad_norm = self._grad_norm ** 0.5
+        loss = super().step(closure)
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    param_id = id(p)
+
+                    # Recreate buffer if moved
+                    if self._param_devices.get(param_id) != p.device:
+                        self._param_devices[param_id] = p.device
+                        self._noise_buffers[param_id] = torch.empty_like(p, device=p.device)
+
+                    # Inject noise
+                    noise_buffer = self._noise_buffers[param_id]
+                    noise_buffer.normal_()
+                    p.data.add_(noise_buffer, alpha=self.tunneling * group['lr'])
+
         return loss
+
+    def get_last_grad_norm(self):
+        return self._grad_norm
+
+    def reset_noise_buffers(self):
+        """Reinitialize all noise buffers with current devices"""
+        for group in self.param_groups:
+            for p in group['params']:
+                param_id = id(p)
+                self._noise_buffers[param_id] = torch.empty_like(p, device=p.device)
+                self._param_devices[param_id] = p.device
+
 
 def create_model(vocab_size=50257, **kwargs):
     model = EfficientCSST_Ultra(vocab_size=vocab_size, **kwargs)
@@ -354,70 +422,42 @@ def train_step(model, batch, optimizer, scaler=None):
     model.train()
     device = next(model.parameters()).device
     input_ids = batch["input_ids"].to(device)
+    optimizer.zero_grad(set_to_none=True)
 
-    with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+    # Forward pass (AMP handles BF16 conversion)
+    with autocast(device_type="cuda", dtype=torch.bfloat16):
         logits, spike_rate = model(input_ids)
         targets = input_ids[:, 1:].contiguous().view(-1)
         logits = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
+        loss = F.cross_entropy(logits, targets)
 
-        # Stabilize logits before loss calculation
-        logits = torch.clamp(logits, min=-20.0, max=20.0)
-
-        loss = F.cross_entropy(logits, targets, reduction='mean')
-
+    # Early NaN check
     if not torch.isfinite(loss):
-        logger.warning(f"⚠️ Skipping NaN/Inf loss: {loss}")
-        optimizer.zero_grad(set_to_none=True)
-        return {
-            "loss": float('nan'),
-            "spike_rate": spike_rate.item(),
-            "sleep_cycle": model.sleep_cycle.item()
-        }
+        logger.warning("NaN/Inf loss detected - skipping step")
+        return {"loss": float('nan'), "spike_rate": 0.0}
 
-    optimizer.zero_grad(set_to_none=True)
-
-    # Add gradient stabilization before clipping
-    max_grad_value = 1.0  # Clip individual gradient values
-    for param in model.parameters():
-        if param.grad is not None:
-            param.grad.data = torch.clamp(param.grad.data, -max_grad_value, max_grad_value)
-            
-    # Then proceed with gradient clipping
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    
-    # Gradient monitoring
-    total_grad_norm = 0.0
-    
+    # Backward pass
     if scaler:
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        scaler.unscale_(optimizer)  # Moves grads to FP32
         
-        # Calculate gradient norm before clipping
+        # Clip then clamp
+        total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         for p in model.parameters():
             if p.grad is not None:
-                total_grad_norm += p.grad.detach().data.norm(2).item() ** 2
-        total_grad_norm = total_grad_norm ** 0.5
-                
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                p.grad.data.clamp_(-0.5, 0.5)
+        
         scaler.step(optimizer)
         scaler.update()
     else:
         loss.backward()
-        
-        # Calculate gradient norm before clipping
-        for p in model.parameters():
-            if p.grad is not None:
-                total_grad_norm += p.grad.detach().data.norm(2).item() ** 2
-        total_grad_norm = total_grad_norm ** 0.5
-        
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
     return {
         "loss": loss.item(),
         "spike_rate": spike_rate.item(),
-        "grad_norm": total_grad_norm,
-        "sleep_cycle": model.sleep_cycle.item()
+        "grad_norm": total_grad_norm if scaler else 0.0
     }
 
 def print_memory_summary():
